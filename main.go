@@ -5,48 +5,81 @@ package main
 import (
 	"context"
 	"fmt"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/ValdemarGr/DM874-go/pb"
 	"github.com/golang/protobuf/proto"
 	"github.com/segmentio/kafka-go"
+	"os"
 )
 
-const topic = "testtopic3"
+var producerMapLock sync.RWMutex
 
-func produce() {
+func produce(writer *kafka.Writer, data *pb.Message) {
 	time.Sleep(time.Second * 2)
 
-	data := &pb.Message{
-		SenderId: 69,
-		Message:  "This is a cool message\nAnd Bye!",
-	}
+	asBa, _ := proto.Marshal(data)
 
-	as_ba, _ := proto.Marshal(data)
-
-	w := kafka.NewWriter(kafka.WriterConfig{
-		Brokers:  []string{"localhost:9092"},
-		Topic:    topic,
-		Balancer: &kafka.LeastBytes{},
-	})
-
-	fmt.Print("Writing\n")
-
-	_ = w.WriteMessages(context.Background(),
+	_ = writer.WriteMessages(context.Background(),
 		kafka.Message{
-			Key:   []byte("HEY"),
-			Value: as_ba,
+			Value: asBa,
 		},
 	)
 }
 
+func applyLanguageFilter(data string) string {
+	var languageFilter = [...]string{
+		"curseword",
+	}
+
+	message := data // copy
+
+	// Apply language filter
+	for _, replacementString := range languageFilter {
+		message = strings.Replace(
+			message,
+			replacementString,
+			strings.Repeat(
+				replacementString,
+				len(replacementString),
+			),
+			-1,
+		)
+	}
+
+	return message
+}
+
+// Either gets the element of the map using a read many lock or creates a new using a write one lock
+func readOrInit(m map[string]*kafka.Writer, topic string, listedBrokers []string) *kafka.Writer {
+	producerMapLock.RLock()
+	writer, ok := m[topic]
+	producerMapLock.RUnlock()
+
+	if !ok {
+		producerMapLock.Lock()
+		writer = kafka.NewWriter(kafka.WriterConfig{
+			Brokers:  listedBrokers,
+			Topic:    topic,
+			Balancer: &kafka.LeastBytes{},
+		})
+		m[topic] = writer
+		producerMapLock.Unlock()
+	}
+
+	return writer
+}
+
 func main() {
+	inTopic := os.Getenv("PROFANITY_FILTER_CONSUMER_TOPIC")
+	kafkaBrokers := os.Getenv("KAFKA_BROKERS")
+	listedBrokers := strings.Split(kafkaBrokers, ",")
 
-	go produce()
-
-	r := kafka.NewReader(kafka.ReaderConfig{
-		Brokers:     []string{"localhost:9092"},
-		Topic:       topic,
+	reader := kafka.NewReader(kafka.ReaderConfig{
+		Brokers:     listedBrokers,
+		Topic:       inTopic,
 		Partition:   0,
 		MinBytes:    10e3, // 10KB
 		MaxBytes:    10e6, // 10MB
@@ -54,21 +87,43 @@ func main() {
 		StartOffset: kafka.LastOffset,
 	})
 
+	writerMap := make(map[string]*kafka.Writer)
+
 	for {
-		m, err := r.ReadMessage(context.Background())
+		m, err := reader.ReadMessage(context.Background())
 		if err != nil {
 			break
 		}
-		fmt.Printf("message at offset %d: %s\n", m.Offset, string(m.Key))
 
 		newData := &pb.Message{}
 		_ = proto.Unmarshal(m.Value, newData)
 
-		fmt.Print(newData.Message)
+		minimum := int32(^uint(0) >> 1)
+		for c := range newData.Tasks {
+			if minimum < c {
+				minimum = c
+			}
+		}
 
-		fmt.Print(newData.SenderId)
+		elem, ok := newData.Tasks[minimum]
+
+		outTopic := elem.Topic
+
+		if !ok {
+			break
+		}
+
+		newData.Statefuldata = applyLanguageFilter(newData.Statefuldata)
+
+		// Its expensive to create a new writer connection on each message, we we use a type of cached map of topic to producer
+		writer := readOrInit(writerMap, outTopic, listedBrokers)
+
+		delete(newData.Tasks, minimum) // "pop" the job we are doing, off the stack
+
+		//Produce the next message
+		go produce(writer, newData)
 	}
 
-	ce := r.Close()
+	ce := reader.Close()
 	fmt.Print(ce)
 }
